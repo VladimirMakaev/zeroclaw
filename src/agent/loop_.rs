@@ -12,9 +12,11 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -328,6 +330,66 @@ async fn auto_compact_history(
     apply_compaction_summary(history, start, compact_end, &summary);
 
     Ok(true)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InteractiveSessionState {
+    version: u32,
+    history: Vec<ChatMessage>,
+}
+
+impl InteractiveSessionState {
+    fn from_history(history: &[ChatMessage]) -> Self {
+        Self {
+            version: 1,
+            history: history.to_vec(),
+        }
+    }
+}
+
+const SESSION_STATE_VERSION: u32 = 1;
+
+fn load_interactive_session_history(path: &Path, system_prompt: &str) -> Result<Vec<ChatMessage>> {
+    if !path.exists() {
+        return Ok(vec![ChatMessage::system(system_prompt)]);
+    }
+
+    let raw = std::fs::read_to_string(path)?;
+    let state: InteractiveSessionState = serde_json::from_str(&raw)?;
+
+    if state.version != SESSION_STATE_VERSION {
+        anyhow::bail!(
+            "unsupported session state version {} (expected {})",
+            state.version,
+            SESSION_STATE_VERSION
+        );
+    }
+
+    let mut history = state.history;
+    if history.is_empty() {
+        history.push(ChatMessage::system(system_prompt));
+    } else if history.first().map(|msg| msg.role.as_str()) == Some("system") {
+        // Always replace with the current system prompt so config changes take effect.
+        history[0] = ChatMessage::system(system_prompt);
+    } else {
+        history.insert(0, ChatMessage::system(system_prompt));
+    }
+
+    Ok(history)
+}
+
+fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(history))?;
+
+    // Atomic write: write to a temp file in the same directory, then rename.
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, payload)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
 }
 
 /// Build context preamble by searching memory for relevant entries.
@@ -2905,6 +2967,7 @@ pub async fn run(
     temperature: f64,
     peripheral_overrides: Vec<String>,
     interactive: bool,
+    session_state_file: Option<PathBuf>,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -3268,7 +3331,11 @@ pub async fn run(
         let cli = crate::channels::CliChannel::new();
 
         // Persistent conversation history across turns
-        let mut history = vec![ChatMessage::system(&system_prompt)];
+        let mut history = if let Some(path) = session_state_file.as_deref() {
+            load_interactive_session_history(path, &system_prompt)?
+        } else {
+            vec![ChatMessage::system(&system_prompt)]
+        };
 
         loop {
             print!("> ");
@@ -3341,6 +3408,9 @@ pub async fn run(
                         println!("Conversation cleared ({cleared} memory entries removed).\n");
                     } else {
                         println!("Conversation cleared.\n");
+                    }
+                    if let Some(path) = session_state_file.as_deref() {
+                        save_interactive_session_history(path, &history)?;
                     }
                     continue;
                 }
@@ -3434,6 +3504,10 @@ pub async fn run(
 
             // Hard cap as a safety net.
             trim_history(&mut history, config.agent.max_history_messages);
+
+            if let Some(path) = session_state_file.as_deref() {
+                save_interactive_session_history(path, &history)?;
+            }
         }
     }
 
@@ -3674,6 +3748,107 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        apply_compaction_summary, build_compaction_transcript, load_interactive_session_history,
+        save_interactive_session_history, InteractiveSessionState,
+    };
+    use crate::providers::ChatMessage;
+    use tempfile::tempdir;
+
+    #[test]
+    fn interactive_session_state_round_trips_history() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+        ];
+
+        save_interactive_session_history(&path, &history).unwrap();
+        let restored = load_interactive_session_history(&path, "fallback").unwrap();
+
+        assert_eq!(restored.len(), 3);
+        assert_eq!(restored[0].role, "system");
+        assert_eq!(restored[1].content, "hello");
+        assert_eq!(restored[2].content, "hi");
+    }
+
+    #[test]
+    fn interactive_session_state_replaces_stale_system_prompt() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let history = vec![
+            ChatMessage::system("old system prompt"),
+            ChatMessage::user("hello"),
+        ];
+
+        save_interactive_session_history(&path, &history).unwrap();
+        let restored = load_interactive_session_history(&path, "new system prompt").unwrap();
+
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].role, "system");
+        assert_eq!(restored[0].content, "new system prompt");
+        assert_eq!(restored[1].content, "hello");
+    }
+
+    #[test]
+    fn interactive_session_state_adds_missing_system_prompt() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let payload = serde_json::to_string_pretty(&InteractiveSessionState {
+            version: 1,
+            history: vec![ChatMessage::user("orphan")],
+        })
+        .unwrap();
+        std::fs::write(&path, payload).unwrap();
+
+        let restored = load_interactive_session_history(&path, "fallback system").unwrap();
+
+        assert_eq!(restored[0].role, "system");
+        assert_eq!(restored[0].content, "fallback system");
+        assert_eq!(restored[1].content, "orphan");
+    }
+
+    #[test]
+    fn interactive_session_state_returns_fresh_for_nonexistent_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("does_not_exist.json");
+
+        let history = load_interactive_session_history(&path, "fresh system").unwrap();
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "system");
+        assert_eq!(history[0].content, "fresh system");
+    }
+
+    #[test]
+    fn interactive_session_state_rejects_corrupt_json() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("corrupt.json");
+        std::fs::write(&path, "{ not valid json !!!").unwrap();
+
+        let result = load_interactive_session_history(&path, "sys");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn interactive_session_state_rejects_unknown_version() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("future.json");
+        let payload = serde_json::to_string_pretty(&InteractiveSessionState {
+            version: 99,
+            history: vec![ChatMessage::user("future")],
+        })
+        .unwrap();
+        std::fs::write(&path, payload).unwrap();
+
+        let result = load_interactive_session_history(&path, "sys");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("unsupported session state version"));
+    }
+
     use super::*;
     use async_trait::async_trait;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
